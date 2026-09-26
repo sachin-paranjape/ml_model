@@ -1,0 +1,6 @@
+student_resource/dataset/
+student_resource/output/
+*.zip
+*.tsv
+__pycache__/
+.ipynb_checkpoints/
