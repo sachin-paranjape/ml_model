@@ -39,8 +39,8 @@ def _generate_candidates_for_country(
     s1_df,
     s23_df,
     top_k: int = 50,
-    max_df: float = 0.05,
-    chunk_size: int = 250,
+    max_df: float = 0.02,
+    chunk_size: int = 500,
 ) -> Dict[str, List[str]]:
     """Return ``{s1_id: [candidate_s23_ids …]}`` for one country."""
 
@@ -73,23 +73,25 @@ def _generate_candidates_for_country(
         s23_tfidf.shape,
     )
 
-    # ── Chunked sparse dot-product ────────────────────────────────────────
+    # ── Multi-threaded chunked sparse dot-product ──────────────────────────
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     candidates: Dict[str, List[str]] = {}
     n_chunks = (len(s1_df) + chunk_size - 1) // chunk_size
     t0 = time.time()
 
-    for ci in range(n_chunks):
+    def _eval_chunk(ci):
         lo = ci * chunk_size
         hi = min(lo + chunk_size, len(s1_df))
-        sim = s1_tfidf[lo:hi].dot(s23_tfidf.T)       # sparse CSR
-
+        sim = s1_tfidf[lo:hi].dot(s23_tfidf.T)
+        chunk_cands = []
         for j in range(sim.shape[0]):
             eid = s1_eids[lo + j]
             start = sim.indptr[j]
             end = sim.indptr[j + 1]
 
             if end == start:
-                candidates[eid] = []
+                chunk_cands.append((eid, []))
                 continue
 
             data = sim.data[start:end]
@@ -103,17 +105,24 @@ def _generate_candidates_for_country(
                 order = np.argsort(data)[::-1]
                 selected = indices[order]
 
-            candidates[eid] = s23_eids[selected].tolist()
+            chunk_cands.append((eid, s23_eids[selected].tolist()))
+        return chunk_cands
 
-        del sim
-
-        if (ci + 1) % 50 == 0 or ci == n_chunks - 1:
-            elapsed = time.time() - t0
-            eta = elapsed / (ci + 1) * (n_chunks - ci - 1)
-            logger.info(
-                "    chunk %d/%d  (%.0fs elapsed, ETA %.0fs)",
-                ci + 1, n_chunks, elapsed, eta,
-            )
+    completed = 0
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(_eval_chunk, ci): ci for ci in range(n_chunks)}
+        for f in as_completed(futures):
+            chunk_res = f.result()
+            for eid, c_list in chunk_res:
+                candidates[eid] = c_list
+            completed += 1
+            if completed % 100 == 0 or completed == n_chunks:
+                elapsed = time.time() - t0
+                eta = elapsed / completed * (n_chunks - completed)
+                logger.info(
+                    "    chunk %d/%d  (%.0fs elapsed, ETA %.0fs)",
+                    completed, n_chunks, elapsed, eta,
+                )
 
     return candidates
 

@@ -138,45 +138,123 @@ def run_training(base_dir: str, model_dir: str, sample_size: int, top_k: int):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def run_test(base_dir: str, output_dir: str, model_dir: str, top_k: int):
-    """Run blocking + inference on the test set, write output files."""
+    """Run country-partitioned blocking + inference on the test set, write output files."""
 
     logger.info("=" * 70)
-    logger.info("STAGE: TEST INFERENCE")
+    logger.info("STAGE: TEST INFERENCE (Country-by-Country Stream)")
     logger.info("=" * 70)
 
     model, threshold = load_model(model_dir)
 
-    # ── load & preprocess ─────────────────────────────────────────────────
+    # ── load raw test tables ──────────────────────────────────────────────
     t0 = time.time()
     s1, s2, s3 = load_sources(base_dir, "test")
     logger.info("Test data loaded in %.0fs", time.time() - t0)
 
-    s1_pp  = preprocess_df(s1)
-    s23    = pd.concat([s2, s3], ignore_index=True)
-    s23_pp = preprocess_df(s23)
-    del s2, s3; gc.collect()
-
-    s1_eids = s1_pp["entity_id"].values
-
-    # ── blocking ──────────────────────────────────────────────────────────
-    cand_path = os.path.join(output_dir, "candidate_pairs.tsv")
-    logger.info("\n── Test blocking ──")
-    test_candidates = run_blocking(s1_pp, s23_pp, top_k=top_k, output_path=cand_path)
-
-    # ── inference ─────────────────────────────────────────────────────────
-    s1_lookup  = build_lookup(s1_pp)
-    s23_lookup = build_lookup(s23_pp)
-    del s23_pp; gc.collect()
-
-    logger.info("\n── Scoring ──")
-    results = run_inference(
-        model, threshold, test_candidates, s1_lookup, s23_lookup, s1_eids,
-    )
-
-    # ── save ──────────────────────────────────────────────────────────────
+    # Output file paths
+    cand_path  = os.path.join(output_dir, "candidate_pairs.tsv")
     match_path = os.path.join(output_dir, "matching_results.tsv")
-    save_matching_results(results, s1_eids, match_path)
 
+    # Check if France is already completed in existing output files
+    completed_countries = set()
+    total_s1 = 0
+    total_matched = 0
+
+    if os.path.exists(match_path) and os.path.exists(cand_path):
+        with open(match_path, "r", encoding="utf-8") as f:
+            n_lines = sum(1 for _ in f)
+        if n_lines == 259453:
+            completed_countries.add("France")
+            total_s1 = 259452
+            total_matched = 250415
+            logger.info("✓ France is already complete (259,452 entities). Resuming with remaining countries!")
+
+    if "France" not in completed_countries:
+        with open(cand_path, "w", encoding="utf-8") as f_cand:
+            f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
+        with open(match_path, "w", encoding="utf-8") as f_match:
+            f_match.write("source1_entity_id\tmatched_entity_ids\n")
+
+    countries = [c for c in sorted(s1["country"].unique()) if c not in completed_countries]
+    logger.info("Processing countries: %s", countries)
+
+    for country in countries:
+        logger.info("\n" + "=" * 50)
+        logger.info("══ Country: %s ══", country)
+        logger.info("=" * 50)
+
+        # 1. Filter and preprocess ONLY for this country
+        s1_c_raw = s1[s1["country"] == country].reset_index(drop=True)
+        s2_c_raw = s2[s2["country"] == country]
+        s3_c_raw = s3[s3["country"] == country]
+        s23_c_raw = pd.concat([s2_c_raw, s3_c_raw], ignore_index=True)
+        del s2_c_raw, s3_c_raw; gc.collect()
+
+        s1_c  = preprocess_df(s1_c_raw)
+        s23_c = preprocess_df(s23_c_raw)
+        del s1_c_raw, s23_c_raw; gc.collect()
+
+        s1_c_eids = s1_c["entity_id"].values
+        logger.info("  %s S1: %d  |  S2+S3: %d", country, len(s1_c), len(s23_c))
+
+        if len(s23_c) == 0:
+            with open(cand_path, "a", encoding="utf-8") as f_cand:
+                for eid in s1_c_eids:
+                    f_cand.write(f"{eid}\t\n")
+            with open(match_path, "a", encoding="utf-8") as f_match:
+                for eid in s1_c_eids:
+                    f_match.write(f"{eid}\t\n")
+            total_s1 += len(s1_c_eids)
+            del s1_c, s23_c; gc.collect()
+            continue
+
+        # 2. Blocking for this country
+        from src.blocking import _generate_candidates_for_country
+        cands = _generate_candidates_for_country(
+            s1_c, s23_c, top_k=top_k, max_df=0.02, chunk_size=500
+        )
+
+        # Append candidates to candidate_pairs.tsv
+        with open(cand_path, "a", encoding="utf-8") as f_cand:
+            for eid in s1_c_eids:
+                c_list = cands.get(eid, [])
+                f_cand.write(f"{eid}\t{','.join(c_list)}\n")
+
+        # 3. Build lookups ONLY for this country
+        s1_lookup  = build_lookup(s1_c)
+        s23_lookup = build_lookup(s23_c)
+        del s23_c; gc.collect()
+
+        # 4. Run inference for this country
+        results = run_inference(
+            model, threshold, cands, s1_lookup, s23_lookup, s1_c_eids, batch_size=200_000
+        )
+
+        # Append matches to matching_results.tsv
+        with open(match_path, "a", encoding="utf-8") as f_match:
+            for eid in s1_c_eids:
+                matches = results.get(eid, [])
+                seen = set()
+                unique = []
+                for m in matches:
+                    if m not in seen:
+                        seen.add(m)
+                        unique.append(m)
+                f_match.write(f"{eid}\t{','.join(unique)}\n")
+
+        c_matched = sum(1 for v in results.values() if v)
+        total_s1 += len(s1_c_eids)
+        total_matched += c_matched
+        logger.info("  %s done: %d entities, %d matched (%.1f%%)",
+                    country, len(s1_c_eids), c_matched, 100 * c_matched / max(len(s1_c_eids), 1))
+
+        # Clean up this country entirely from memory
+        del s1_c, cands, s1_lookup, s23_lookup, results; gc.collect()
+
+    del s1, s2, s3; gc.collect()
+
+    logger.info("\nInference Complete — Total S1: %d, Matched: %d (%.1f%%), Singletons: %d",
+                total_s1, total_matched, 100 * total_matched / max(total_s1, 1), total_s1 - total_matched)
     return match_path, cand_path
 
 
